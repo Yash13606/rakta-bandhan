@@ -1,12 +1,16 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_analytics/firebase_analytics.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart' show XFile;
+
+import 'geo_config.dart';
 
 /// Recipient blood group -> donor groups that can give to it.
 const bloodCompatibility = <String, List<String>>{
@@ -25,11 +29,14 @@ const requestExpiryHours = 6;
 
 const _base32 = '0123456789bcdefghjkmnpqrstuvwxyz';
 
-/// Standard interleaved-bits geohash encoder. Stored on donor/request docs
-/// for schema parity with the Cloud Functions upgrade path (geofire-common
-/// on the server side); the live app itself never runs a geohash range
-/// query — dataset is demo-scale, so donor/request lists are just filtered
-/// and sorted by Haversine distance client-side.
+/// Standard interleaved-bits geohash encoder. Stored on donor/request docs;
+/// `_geohashCellsAround`/`_geohashRangeStream` below use it for real range
+/// queries (Geoflutterfire-style) in the proximity-search paths. The
+/// blanket "browse everything" streams (`openRequestsStream`,
+/// `availableDonorsStream`) still filter/sort by Haversine distance
+/// client-side instead — narrowing those to a radius is a visibility
+/// decision (would a request/donor outside the radius go unseen?), not
+/// just a performance one, so it's left alone here.
 String encodeGeohash(double lat, double lng, {int precision = 9}) {
   double latMin = -90, latMax = 90, lngMin = -180, lngMax = 180;
   final buffer = StringBuffer();
@@ -74,6 +81,75 @@ double distanceKm(double lat1, double lng1, double lat2, double lng2) {
   final a = sin(dLat / 2) * sin(dLat / 2) +
       cos(lat1 * pi / 180) * cos(lat2 * pi / 180) * sin(dLng / 2) * sin(dLng / 2);
   return earthRadiusKm * 2 * atan2(sqrt(a), sqrt(1 - a));
+}
+
+/// Reverses [encodeGeohash]'s bit-interleaving loop to recover the cell's
+/// lat/lng bounding box — same alphabet, same isEven-starts-on-lng order,
+/// so a hash this decodes is always one this file itself encoded.
+(double, double, double, double) _decodeGeohashBounds(String hash) {
+  double latMin = -90, latMax = 90, lngMin = -180, lngMax = 180;
+  var isEven = true;
+  for (final char in hash.split('')) {
+    final idx = _base32.indexOf(char);
+    for (var mask = 16; mask != 0; mask >>= 1) {
+      if (isEven) {
+        final mid = (lngMin + lngMax) / 2;
+        if (idx & mask != 0) {
+          lngMin = mid;
+        } else {
+          lngMax = mid;
+        }
+      } else {
+        final mid = (latMin + latMax) / 2;
+        if (idx & mask != 0) {
+          latMin = mid;
+        } else {
+          latMax = mid;
+        }
+      }
+      isEven = !isEven;
+    }
+  }
+  return (latMin, latMax, lngMin, lngMax);
+}
+
+/// The coarsest (most selective) geohash precision whose cell still spans
+/// at least [radiusKm] in both directions at [lat] — picking the finest
+/// precision that still comfortably contains the search radius keeps the
+/// 3x3 neighbor grid below from missing anything a plain single-cell query
+/// would (the classic geohash-query edge case: the search point sitting
+/// near a cell boundary).
+int _precisionForRadius(double lat, double radiusKm) {
+  for (var precision = 9; precision >= 1; precision--) {
+    final (latMin, latMax, lngMin, lngMax) = _decodeGeohashBounds(encodeGeohash(lat, 0, precision: precision));
+    final latKm = (latMax - latMin) * 111.32;
+    final lngKm = (lngMax - lngMin) * 111.32 * cos(lat * pi / 180).abs();
+    if (latKm >= radiusKm && lngKm >= radiusKm) return precision;
+  }
+  return 1;
+}
+
+/// The center cell covering ([lat], [lng]) at [precision] plus its 8
+/// neighbors — the standard 3x3 grid a Firestore geohash range query scans
+/// (each cell becomes one `[cell, cell + '~']` prefix range in
+/// [_geohashRangeStream]). The true radius cutoff still happens
+/// client-side afterwards; this grid only bounds which documents Firestore
+/// has to return in the first place.
+List<String> _geohashCellsAround(double lat, double lng, int precision) {
+  final center = encodeGeohash(lat, lng, precision: precision);
+  final (latMin, latMax, lngMin, lngMax) = _decodeGeohashBounds(center);
+  final latStep = latMax - latMin;
+  final lngStep = lngMax - lngMin;
+  final cells = <String>{center};
+  for (final dLat in [-1, 0, 1]) {
+    for (final dLng in [-1, 0, 1]) {
+      if (dLat == 0 && dLng == 0) continue;
+      final nLat = (lat + dLat * latStep).clamp(-90.0, 90.0);
+      final nLng = ((lng + dLng * lngStep + 180) % 360 + 360) % 360 - 180;
+      cells.add(encodeGeohash(nLat, nLng, precision: precision));
+    }
+  }
+  return cells.toList();
 }
 
 /// Thrown when a donor tries to accept a request someone else already claimed.
@@ -148,6 +224,24 @@ class Backend {
 
   Future<void> signOut() => _auth.signOut();
 
+  /// Firebase requires a fresh sign-in before destructive account actions
+  /// (user.delete()). With the fake-OTP scheme the credential is derivable
+  /// from the session itself; once real phone auth lands this becomes a
+  /// fresh OTP round-trip instead.
+  Future<void> reauthenticateForSensitiveAction() async {
+    final user = _auth.currentUser;
+    final email = user?.email;
+    if (user == null || email == null) return;
+    await user.reauthenticateWithCredential(
+      EmailAuthProvider.credential(email: email, password: _fakeAuthPassword),
+    );
+  }
+
+  /// ~1.1 km precision. donors_public is readable by every signed-in user,
+  /// and the consent screen promises donors are shown "approximately" —
+  /// exact coordinates only ever live on the private donors/{uid} doc.
+  static double _coarse(double degrees) => (degrees * 100).roundToDouble() / 100;
+
   Future<DocumentSnapshot<Map<String, dynamic>>> myDonorDoc() =>
       _db.collection('donors').doc(_uid).get();
 
@@ -195,9 +289,9 @@ class Backend {
       tx.set(_db.collection('donors_public').doc(_uid), {
         'name': name,
         'blood_group': bloodGroup,
-        'geohash': geohash,
-        'lat': lat,
-        'lng': lng,
+        'geohash': encodeGeohash(_coarse(lat), _coarse(lng), precision: 6),
+        'lat': _coarse(lat),
+        'lng': _coarse(lng),
         'is_available': true,
         'is_verified': false,
         'updated_at': now,
@@ -214,13 +308,40 @@ class Backend {
   /// screen.dart) constrains the picked image's resolution/quality so the
   /// encoded string comfortably fits Firestore's 1MiB document limit.
   /// Admins view it from AdminDonorDetailScreen before verifying.
+  ///
+  /// The image lives in its own document (`donors/{uid}/private/id_proof`),
+  /// not inline on the profile: the profile is read on nearly every screen,
+  /// and an inline ~200 KB image made every one of those reads download it.
+  /// The profile keeps only a `has_id_proof` flag.
   Future<void> uploadIdProof(XFile file) async {
     final bytes = await file.readAsBytes();
-    await _db.collection('donors').doc(_uid).update({
-      'id_proof_base64': base64Encode(bytes),
-      'id_proof_content_type': file.mimeType ?? 'image/jpeg',
+    final batch = _db.batch();
+    batch.set(_idProofRef(_uid), {
+      'base64': base64Encode(bytes),
+      'content_type': file.mimeType ?? 'image/jpeg',
+      'uploaded_at': FieldValue.serverTimestamp(),
     });
+    batch.update(_db.collection('donors').doc(_uid), {
+      'has_id_proof': true,
+      'id_proof_base64': FieldValue.delete(),
+      'id_proof_content_type': FieldValue.delete(),
+    });
+    await batch.commit();
   }
+
+  DocumentReference<Map<String, dynamic>> _idProofRef(String uid) =>
+      _db.collection('donors').doc(uid).collection('private').doc('id_proof');
+
+  /// Owner/admin only (rules). Falls back to the legacy inline field for
+  /// donors who uploaded before the image moved to its own document.
+  Future<String?> fetchIdProof(String uid) async {
+    final own = (await _idProofRef(uid).get()).data()?['base64'] as String?;
+    if (own != null) return own;
+    return (await _db.collection('donors').doc(uid).get()).data()?['id_proof_base64'] as String?;
+  }
+
+  /// Account deletion: the ID image document goes with the profile.
+  Future<void> deleteMyIdProof() => _idProofRef(_uid).delete();
 
   Future<void> setAvailability(bool available) async {
     await _db.runTransaction((tx) async {
@@ -231,6 +352,19 @@ class Backend {
       });
     });
   }
+
+  /// Opt-in for the ringing urgent-request alert (see UrgentAlertService).
+  /// Stored on the private profile so a future Blaze push function can
+  /// honour the same preference server-side.
+  Future<void> setUrgentAlerts(bool enabled) =>
+      _db.collection('donors').doc(_uid).update({'urgent_alerts': enabled});
+
+  /// FCM device token, for the Blaze-era push functions (urgent alerts,
+  /// incoming calls, chat). Owner-only doc, so never visible to others.
+  Future<void> savePushToken(String token) => _db.collection('donors').doc(_uid).update({
+        'fcm_token': token,
+        'fcm_token_updated_at': FieldValue.serverTimestamp(),
+      });
 
   /// Client-side stand-in for scheduledReactivation.js — call on profile load.
   Future<void> maybeReactivate() async {
@@ -243,8 +377,81 @@ class Backend {
     await setAvailability(true);
   }
 
+  /// Whole-collection scan — reads every available donor. Kept for the
+  /// admin/preview paths only; user-facing screens use NearbyDonors, whose
+  /// cost scales with local density instead of total signups.
   Stream<QuerySnapshot<Map<String, dynamic>>> availableDonorsStream() =>
       _db.collection('donors_public').where('is_available', isEqualTo: true).snapshots();
+
+  /// Real geohash range query (Geoflutterfire-style): scans only the 3x3
+  /// grid of cells around ([lat], [lng]) sized to [radiusKm], instead of
+  /// every available donor in the collection. Firestore can't OR multiple
+  /// range queries together, so this merges up to 9 live per-cell
+  /// snapshots streams client-side — still cheap, since each cell only
+  /// reads the donors actually inside it. The grid over-covers slightly at
+  /// its corners; callers should still apply the real `radiusKm` cutoff via
+  /// [distanceKm] before treating a result as "nearby" (see
+  /// find_donors_screen.dart).
+  Stream<List<QueryDocumentSnapshot<Map<String, dynamic>>>> availableDonorsNearbyStream({
+    required double lat,
+    required double lng,
+    double radiusKm = 50,
+  }) {
+    final precision = _precisionForRadius(lat, radiusKm);
+    final cells = _geohashCellsAround(lat, lng, precision);
+    return _geohashRangeStream(
+      collection: 'donors_public',
+      cells: cells,
+      extraFilters: (q) => q.where('is_available', isEqualTo: true),
+    );
+  }
+
+  /// Fans out one live query per geohash cell and combines their latest
+  /// results into a single deduped stream (Firestore has no native
+  /// multi-range OR query, so this is the client-side merge every
+  /// geohash-query library — Geoflutterfire included — does under the hood).
+  Stream<List<QueryDocumentSnapshot<Map<String, dynamic>>>> _geohashRangeStream({
+    required String collection,
+    required List<String> cells,
+    required Query<Map<String, dynamic>> Function(Query<Map<String, dynamic>>) extraFilters,
+  }) {
+    late final StreamController<List<QueryDocumentSnapshot<Map<String, dynamic>>>> controller;
+    final latest = <String, List<QueryDocumentSnapshot<Map<String, dynamic>>>>{};
+    final subs = <StreamSubscription>[];
+
+    void emit() {
+      final seen = <String>{};
+      final merged = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+      for (final docs in latest.values) {
+        for (final doc in docs) {
+          if (seen.add(doc.id)) merged.add(doc);
+        }
+      }
+      controller.add(merged);
+    }
+
+    controller = StreamController<List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
+      onListen: () {
+        for (final cell in cells) {
+          Query<Map<String, dynamic>> q = _db
+              .collection(collection)
+              .where('geohash', isGreaterThanOrEqualTo: cell)
+              .where('geohash', isLessThan: '$cell~');
+          q = extraFilters(q);
+          subs.add(q.snapshots().listen((snap) {
+            latest[cell] = snap.docs;
+            emit();
+          }, onError: controller.addError));
+        }
+      },
+      onCancel: () async {
+        for (final sub in subs) {
+          await sub.cancel();
+        }
+      },
+    );
+    return controller.stream;
+  }
 
   /// Open requests, newest first. Blood-group compatibility is filtered
   /// client-side (see note on encodeGeohash above) to avoid needing an
@@ -364,6 +571,29 @@ class Backend {
     _logEvent('request_matched', {'request_id': requestId});
   }
 
+  /// The matched donor backs out ("I can't make it"). The request goes
+  /// back to `open` with a fresh expiry window so other donors can accept
+  /// it, and the donor's lock is freed. Their name/phone come off the doc.
+  Future<void> releaseMatch(String requestId) async {
+    await _db.runTransaction((tx) async {
+      final reqRef = _db.collection('requests').doc(requestId);
+      final reqSnap = await tx.get(reqRef);
+      final data = reqSnap.data();
+      if (data == null || data['status'] != 'matched' || data['matched_donor_id'] != _uid) return;
+      tx.update(reqRef, {
+        'status': 'open',
+        'matched_donor_id': null,
+        'matched_donor_name': null,
+        'matched_donor_phone': null,
+        'matched_at': null,
+        'released_at': FieldValue.serverTimestamp(),
+        'expires_at': Timestamp.fromDate(DateTime.now().add(const Duration(hours: requestExpiryHours))),
+      });
+      tx.update(_db.collection('donors').doc(_uid), {'active_request_id': null});
+    });
+    _logEvent('request_released', {'request_id': requestId});
+  }
+
   /// Matched donor self-reports the donation done, writes the immutable
   /// history record, and starts their own 90-day cooldown (admin
   /// confirmation of the same donation is also possible — see
@@ -394,8 +624,55 @@ class Backend {
         'confirmed_by': 'self',
       });
     });
+    await _bumpImpactCounter();
     _logEvent('donation_fulfilled', {'request_id': requestId});
   }
+
+  /// Public, signed-in-readable donation counter for the Community → Impact
+  /// tab. Needed because `requests` can't be queried by `status ==
+  /// 'fulfilled'` from a normal user (the rules only expose *open* requests
+  /// plus your own, precisely so phone numbers on closed requests stay
+  /// private) — so the aggregate is maintained here instead. Rules cap each
+  /// write at +1, which is all a real donation can ever be.
+  Future<void> _bumpImpactCounter() async {
+    final ref = _db.collection('public_stats').doc('impact');
+    final monthKey = _currentMonthKey();
+    try {
+      await _db.runTransaction((tx) async {
+        final snap = await tx.get(ref);
+        if (!snap.exists) {
+          tx.set(ref, {
+            'month_key': monthKey,
+            'donations_this_month': 1,
+            'updated_at': FieldValue.serverTimestamp(),
+          });
+          return;
+        }
+        final sameMonth = snap.data()?['month_key'] == monthKey;
+        tx.update(ref, {
+          'month_key': monthKey,
+          'donations_this_month': sameMonth ? (snap.data()?['donations_this_month'] as num? ?? 0).toInt() + 1 : 1,
+          'updated_at': FieldValue.serverTimestamp(),
+        });
+      });
+    } catch (_) {
+      // A failed counter bump must never fail the donation itself.
+    }
+  }
+
+  static String _currentMonthKey() {
+    final now = DateTime.now();
+    return '${now.year}-${now.month.toString().padLeft(2, '0')}';
+  }
+
+  /// Live "donations this month" for the Community Impact tab.
+  Stream<int> impactThisMonthStream() =>
+      _db.collection('public_stats').doc('impact').snapshots().map((snap) {
+        if (!snap.exists) return 0;
+        final data = snap.data()!;
+        if (data['month_key'] != _currentMonthKey()) return 0;
+        return (data['donations_this_month'] as num? ?? 0).toInt();
+      });
 
   Future<int> myDonationCount() async {
     final snap = await _db
@@ -438,9 +715,19 @@ class Backend {
         'at': FieldValue.serverTimestamp(),
       });
 
+  /// Verifying also deletes the ID-proof photo: once an admin has checked
+  /// it, keeping a copy of someone's ID only adds risk (and storage). The
+  /// profile records that it was checked, and when.
   Future<void> adminVerifyDonor(String donorId) async {
     await _db.runTransaction((tx) async {
-      tx.update(_db.collection('donors').doc(donorId), {'is_verified': true});
+      tx.delete(_idProofRef(donorId));
+      tx.update(_db.collection('donors').doc(donorId), {
+        'is_verified': true,
+        'has_id_proof': false,
+        'id_proof_checked_at': FieldValue.serverTimestamp(),
+        'id_proof_base64': FieldValue.delete(),
+        'id_proof_content_type': FieldValue.delete(),
+      });
       tx.update(_db.collection('donors_public').doc(donorId), {
         'is_verified': true,
         'updated_at': FieldValue.serverTimestamp(),
@@ -476,6 +763,198 @@ class Backend {
     await _logAdminAction(available ? 'mark_available' : 'mark_unavailable', donorId);
   }
 
+  /// Admin-side counterpart to [markFulfilled] — for when the donation is
+  /// confirmed by an admin (e.g. hospital-reported) rather than self-
+  /// reported by the donor. Same effects: request -> fulfilled, the
+  /// matched donor's 90-day cooldown starts, an immutable history record
+  /// is written. Reads the request first (unlike markFulfilled, which
+  /// trusts the caller is the matched donor) since the admin isn't
+  /// necessarily acting on their own uid.
+  Future<void> adminConfirmDonation(String requestId) async {
+    final reactivateAt = DateTime.now().add(const Duration(days: donorCooldownDays));
+    late String donorId;
+
+    await _db.runTransaction((tx) async {
+      final reqRef = _db.collection('requests').doc(requestId);
+      final reqSnap = await tx.get(reqRef);
+      if (!reqSnap.exists) throw StateError('Request not found.');
+      final req = reqSnap.data()!;
+      if (req['status'] != 'matched') throw StateError('Request is not currently matched.');
+      donorId = req['matched_donor_id'] as String;
+
+      tx.update(reqRef, {
+        'status': 'fulfilled',
+        'fulfilled_at': FieldValue.serverTimestamp(),
+        'fulfilled_by': _uid,
+      });
+      tx.update(_db.collection('donors').doc(donorId), {
+        'last_donation_date': FieldValue.serverTimestamp(),
+        'is_available': false,
+        'active_request_id': null,
+        'reactivation_scheduled_at': Timestamp.fromDate(reactivateAt),
+      });
+      tx.update(_db.collection('donors_public').doc(donorId), {
+        'is_available': false,
+        'updated_at': FieldValue.serverTimestamp(),
+      });
+      tx.set(_db.collection('donation_history').doc(), {
+        'donor_id': donorId,
+        'request_id': requestId,
+        'donation_date': FieldValue.serverTimestamp(),
+        'confirmed_by': 'admin',
+        'verified_by': _uid,
+      });
+    });
+    await _bumpImpactCounter();
+    await _logAdminAction('confirm_donation', requestId);
+    _logEvent('donation_fulfilled', {'request_id': requestId, 'confirmed_by': 'admin'});
+  }
+
+  Future<void> adminLogStoryRemoval(String storyId) => _logAdminAction('remove_story', storyId);
+
+  // ------------------------------------------- Admin-managed app content
+  //
+  // Everything the Community tab, the Testimonials page and the Impact
+  // counter show is now a real Firestore collection an admin edits from the
+  // console's Content tab — nothing on those screens is hardcoded copy any
+  // more. `announcements` and `testimonials` have no user-write path at
+  // all (rules: admin-only write, signed-in read), which is what keeps
+  // "curated" honest.
+
+  /// Community → What's New. Newest first; read by any signed-in user.
+  Stream<QuerySnapshot<Map<String, dynamic>>> announcementsStream() => _db
+      .collection('announcements')
+      .orderBy('created_at', descending: true)
+      .limit(50)
+      .snapshots();
+
+  /// More → Testimonials. Curated, admin-authored quotes.
+  Stream<QuerySnapshot<Map<String, dynamic>>> testimonialsStream() => _db
+      .collection('testimonials')
+      .orderBy('created_at', descending: true)
+      .limit(50)
+      .snapshots();
+
+  /// Create (id == null) or edit an announcement. `created_at` is only set
+  /// on create so editing a post doesn't jump it back to the top of the feed.
+  Future<void> adminSaveAnnouncement({String? id, required String title, required String body}) async {
+    final data = {
+      'title': title.trim(),
+      'body': body.trim(),
+      'updated_at': FieldValue.serverTimestamp(),
+      'author_uid': _uid,
+    };
+    if (id == null) {
+      final ref = await _db.collection('announcements').add({...data, 'created_at': FieldValue.serverTimestamp()});
+      await _logAdminAction('publish_announcement', ref.id);
+    } else {
+      await _db.collection('announcements').doc(id).update(data);
+      await _logAdminAction('edit_announcement', id);
+    }
+  }
+
+  Future<void> adminDeleteAnnouncement(String id) async {
+    await _db.collection('announcements').doc(id).delete();
+    await _logAdminAction('delete_announcement', id);
+  }
+
+  Future<void> adminSaveTestimonial({
+    String? id,
+    required String quote,
+    required String name,
+    required String role,
+  }) async {
+    final data = {
+      'quote': quote.trim(),
+      'name': name.trim(),
+      'role': role.trim(),
+      'updated_at': FieldValue.serverTimestamp(),
+      'author_uid': _uid,
+    };
+    if (id == null) {
+      final ref = await _db.collection('testimonials').add({...data, 'created_at': FieldValue.serverTimestamp()});
+      await _logAdminAction('publish_testimonial', ref.id);
+    } else {
+      await _db.collection('testimonials').doc(id).update(data);
+      await _logAdminAction('edit_testimonial', id);
+    }
+  }
+
+  Future<void> adminDeleteTestimonial(String id) async {
+    await _db.collection('testimonials').doc(id).delete();
+    await _logAdminAction('delete_testimonial', id);
+  }
+
+  /// Overrides the Community Impact figure for the current month. The
+  /// +1-only rule that guards a normal donor's bump doesn't apply to an
+  /// admin — this is the correction path for a miscount, or for donations
+  /// confirmed outside the app.
+  Future<void> adminSetImpactCount(int count) async {
+    await _db.collection('public_stats').doc('impact').set({
+      'month_key': _currentMonthKey(),
+      'donations_this_month': count,
+      'updated_at': FieldValue.serverTimestamp(),
+      'set_by_admin': _uid,
+    });
+    await _logAdminAction('set_impact_count', '$count');
+  }
+
+  /// Triage state for an inbox submission — `new`, `in_progress` or
+  /// `resolved`, plus an internal note only admins can read.
+  Future<void> adminSetIssueStatus(String id, String status, {String? note}) async {
+    await _db.collection('issue_reports').doc(id).update({
+      'status': status,
+      if (note != null) 'admin_note': note.trim(),
+      'handled_by': _uid,
+      'handled_at': FieldValue.serverTimestamp(),
+    });
+    await _logAdminAction('issue_$status', id);
+  }
+
+  Future<void> adminDeleteIssueReport(String id) async {
+    await _db.collection('issue_reports').doc(id).delete();
+    await _logAdminAction('delete_issue_report', id);
+  }
+
+  Future<void> adminSetPartnershipStatus(String id, String status, {String? note}) async {
+    await _db.collection('partnership_inquiries').doc(id).update({
+      'status': status,
+      if (note != null) 'admin_note': note.trim(),
+      'handled_by': _uid,
+      'handled_at': FieldValue.serverTimestamp(),
+    });
+    await _logAdminAction('inquiry_$status', id);
+  }
+
+  Future<void> adminDeletePartnershipInquiry(String id) async {
+    await _db.collection('partnership_inquiries').doc(id).delete();
+    await _logAdminAction('delete_partnership_inquiry', id);
+  }
+
+  /// Chat/call abuse reports (ChatService.report) — same triage shape as
+  /// the other inboxes, but rules give admins update only, never delete;
+  /// a report always stays on record.
+  Future<void> adminSetReportStatus(String id, String status, {String? note}) async {
+    await _db.collection('reports').doc(id).update({
+      'status': status,
+      if (note != null) 'admin_note': note.trim(),
+      'handled_by': _uid,
+      'handled_at': FieldValue.serverTimestamp(),
+    });
+    await _logAdminAction('report_$status', id);
+  }
+
+  /// Reversible moderation: the Community feed filters hidden stories out
+  /// client-side, so an admin can take a post down without destroying it.
+  Future<void> adminSetStoryHidden(String id, bool hidden) async {
+    await _db.collection('community_stories').doc(id).update({
+      'is_hidden': hidden,
+      'moderated_by': _uid,
+      'moderated_at': FieldValue.serverTimestamp(),
+    });
+    await _logAdminAction(hidden ? 'hide_story' : 'unhide_story', id);
+  }
+
   Future<void> adminAddHospital(String name, String address) async {
     final ref = await _db.collection('hospitals').add({'name': name, 'address': address});
     await _logAdminAction('add_hospital', ref.id);
@@ -491,6 +970,27 @@ class Backend {
     await _logAdminAction('delete_hospital', id);
   }
 
+  /// Removes a donor's profile (`donors` + `donors_public`) entirely — for
+  /// spam signups, duplicates, or a takedown request. This only deletes the
+  /// Firestore profile: the underlying Firebase Auth account still exists
+  /// and can sign back in, since disabling/deleting another user's Auth
+  /// account needs the Admin SDK (Blaze-only). `is_banned` (adminBanDonor)
+  /// is the Spark-compatible way to actually lock someone out; use delete
+  /// only when the record itself, not just access, needs to go.
+  Future<void> adminDeleteDonor(String donorId) async {
+    await _db.collection('donors_public').doc(donorId).delete();
+    await _db.collection('donors').doc(donorId).delete();
+    await _logAdminAction('delete_donor', donorId);
+  }
+
+  /// Removes a request outright — spam, duplicate or test postings. Rules
+  /// allow this independently of the status-transition checks that gate
+  /// `update`, since a delete isn't a transition.
+  Future<void> adminDeleteRequest(String requestId) async {
+    await _db.collection('requests').doc(requestId).delete();
+    await _logAdminAction('delete_request', requestId);
+  }
+
   /// Not a real broadcast — sending a push needs a server (Cloud Function
   /// + FCM Admin SDK), which is exactly what Spark doesn't allow. This
   /// just records the intent in the audit trail so the admin UI's
@@ -498,47 +998,135 @@ class Backend {
   Future<void> adminSendBroadcast(String message, String audience) =>
       _logAdminAction('broadcast[$audience]', message);
 
-  /// Falls back to Thiruvananthapuram (matches the existing UI's demo
-  /// city) if the browser/device denies location — never blocks the flow.
-  Future<Position> currentPosition() async {
-    try {
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
-        return _fallbackPosition();
-      }
+  /// Edit the donor's own name / phone. `is_verified` and `is_banned` stay
+  /// untouched here — the rules reject an owner write that changes either.
+  Future<void> updateProfile({required String name, required String phone}) async {
+    await _db.runTransaction((tx) async {
+      tx.update(_db.collection('donors').doc(_uid), {'name': name.trim(), 'phone': phone.trim()});
+      tx.update(_db.collection('donors_public').doc(_uid), {
+        'name': name.trim(),
+        'updated_at': FieldValue.serverTimestamp(),
+      });
+    });
+  }
 
+  /// Community stories ("Share an experience"). Public to signed-in users,
+  /// authored under the poster's own uid; admins can moderate/remove.
+  Future<void> submitCommunityStory({
+    required String topic,
+    required String body,
+    String? bloodGroup,
+    String? locationLabel,
+  }) async {
+    final donor = (await myDonorDoc()).data();
+    await _db.collection('community_stories').add({
+      'author_uid': _uid,
+      'author_name': donor?['name'] ?? 'A donor',
+      'topic': topic,
+      'body': body.trim(),
+      'blood_group': bloodGroup,
+      'location_label': locationLabel,
+      'created_at': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Stream<QuerySnapshot<Map<String, dynamic>>> communityStoriesStream() => _db
+      .collection('community_stories')
+      .orderBy('created_at', descending: true)
+      .limit(50)
+      .snapshots();
+
+  /// "Report an issue" (Help & support). One-way — admins read it in the
+  /// console, nothing writes back to the reporter.
+  Future<void> submitIssueReport({required String reason, String? details}) =>
+      _db.collection('issue_reports').add({
+        'reporter_uid': _uid,
+        'reason': reason,
+        'details': details?.trim() ?? '',
+        'created_at': FieldValue.serverTimestamp(),
+      });
+
+  /// "Start a conversation" (Partner with us). Same one-way pattern as
+  /// submitIssueReport.
+  Future<void> submitPartnershipInquiry({
+    required String orgName,
+    required String contactName,
+    required String workEmail,
+    required String interest,
+    String? message,
+  }) =>
+      _db.collection('partnership_inquiries').add({
+        'requester_uid': _uid,
+        'org_name': orgName.trim(),
+        'contact_name': contactName.trim(),
+        'work_email': workEmail.trim(),
+        'interest': interest,
+        'message': message?.trim() ?? '',
+        'created_at': FieldValue.serverTimestamp(),
+      });
+
+  /// The device's real position, or null — never an invented place.
+  ///
+  /// High accuracy with a 12 s budget (a cold GPS start routinely needs
+  /// more than the old 5 s); if the fix times out, the OS's last known
+  /// position is used when there is one. Anything that is *stored* — a
+  /// donor's registered area, a request's location, a location shared in
+  /// chat — must come from here, a search result, or the map picker.
+  Future<Position?> preciseLocation({Duration timeout = const Duration(seconds: 12)}) async {
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) return null;
       var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
       }
-      if (permission == LocationPermission.denied ||
-          permission == LocationPermission.deniedForever) {
-        return _fallbackPosition();
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+        return null;
       }
-      return await Geolocator.getCurrentPosition(
-        timeLimit: const Duration(seconds: 5),
-      );
+      try {
+        return await Geolocator.getCurrentPosition(
+          locationSettings: LocationSettings(accuracy: LocationAccuracy.high, timeLimit: timeout),
+        );
+      } on TimeoutException {
+        if (kIsWeb) return null;
+        return await Geolocator.getLastKnownPosition();
+      }
     } catch (_) {
-      return _fallbackPosition();
+      return null;
     }
   }
 
-  /// OpenStreetMap Nominatim Geocoding API (free, no API key required).
-  /// Converts a typed address into a pickable list of {label, lat, lng}.
-  Future<List<Map<String, dynamic>>> searchAddress(String query) async {
+  /// Where to *centre a map* when there's no real fix: the device position
+  /// if available, else the demo city. Display only — this used to feed
+  /// registration and request creation too, which silently put anyone with
+  /// slow GPS in Thiruvananthapuram. Check [isFallback] before trusting it.
+  Future<Position> currentPosition() async => await preciseLocation() ?? _fallbackPosition();
+
+  static bool isFallback(Position p) => p.accuracy == 0 && p.latitude == 8.5241 && p.longitude == 76.9366;
+
+  Uri _geocodeUri(String path, Map<String, String> params) => kLocationIqKey.isEmpty
+      ? Uri.https('nominatim.openstreetmap.org', path, params)
+      : Uri.https('us1.locationiq.com', '/v1$path', {...params, 'key': kLocationIqKey});
+
+  /// Address search (LocationIQ with a key, else public Nominatim), limited
+  /// to India and biased towards [near] when given — so "City Hospital"
+  /// means the one in your city. Returns {label, lat, lng}.
+  Future<List<Map<String, dynamic>>> searchAddress(String query, {({double lat, double lng})? near}) async {
     if (query.trim().length < 3) return [];
     try {
-      final uri = Uri.https(
-        'nominatim.openstreetmap.org',
-        '/search',
-        {
-          'q': query,
-          'format': 'json',
-          'limit': '5',
-          'addressdetails': '1'
-        },
-      );
-      final response = await http.get(uri, headers: {'User-Agent': 'RaktaBandhan/1.0'});
+      final params = <String, String>{
+        'q': query,
+        'format': 'json',
+        'limit': '6',
+        'addressdetails': '1',
+        'countrycodes': kGeocodeCountryCodes,
+      };
+      if (near != null) {
+        // ~50 km box around the user; results inside rank first, but
+        // anything in India can still match ("bounded" is not set).
+        const d = 0.45;
+        params['viewbox'] = '${near.lng - d},${near.lat + d},${near.lng + d},${near.lat - d}';
+      }
+      final response = await http.get(_geocodeUri('/search', params), headers: {'User-Agent': 'RaktaBandhan/1.0'});
       if (response.statusCode != 200) return [];
       final List results = jsonDecode(response.body);
       return results
@@ -553,22 +1141,15 @@ class Backend {
     }
   }
 
-  /// OpenStreetMap Nominatim reverse geocoding — turns a GPS fix into a real
-  /// street-level address label (e.g. "MG Road, Kochi") instead of a generic
-  /// "Current location" placeholder. Returns null (caller falls back to a 
-  /// generic label) if the lookup fails.
+  /// Reverse geocoding — turns a GPS fix or a dropped pin into a readable
+  /// address. Returns null if the lookup fails (callers show coordinates or
+  /// a generic label instead).
   Future<String?> reverseGeocode(double lat, double lng) async {
     try {
-      final uri = Uri.https(
-        'nominatim.openstreetmap.org',
-        '/reverse',
-        {
-          'lat': lat.toString(),
-          'lon': lng.toString(),
-          'format': 'json',
-        },
+      final response = await http.get(
+        _geocodeUri('/reverse', {'lat': lat.toString(), 'lon': lng.toString(), 'format': 'json', 'zoom': '18'}),
+        headers: {'User-Agent': 'RaktaBandhan/1.0'},
       );
-      final response = await http.get(uri, headers: {'User-Agent': 'RaktaBandhan/1.0'});
       if (response.statusCode != 200) return null;
       final body = jsonDecode(response.body) as Map<String, dynamic>;
       return body['display_name'] as String?;

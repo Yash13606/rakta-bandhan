@@ -53,7 +53,19 @@ service cloud.firestore {
             && request.resource.data.is_verified == resource.data.is_verified
             && request.resource.data.is_banned == resource.data.is_banned);
 
-      allow delete: if isAdmin();
+      // Owner delete = in-app account deletion (App Store 5.1.1(v) /
+      // Google Play account-deletion policy). See AccountService.
+      // Deliberately unconditional, including for a banned donor: both
+      // stores require deletion to always be available in-app, with no
+      // carve-out for a suspended account — a ban can't turn into a
+      // reason to refuse the request.
+      allow delete: if isOwner(uid) || isAdmin();
+
+      // Private attachments (the ID-proof image) — same visibility as the
+      // profile itself, kept out of it so profile reads stay small.
+      match /private/{docId} {
+        allow read, write: if isOwner(uid) || isAdmin();
+      }
     }
 
     // donors_public/{uid} — map-safe mirror. No phone field, ever.
@@ -93,6 +105,34 @@ service cloud.firestore {
     // match. Writes are limited to exactly the transitions
     // backend.dart's client-side transactions perform.
     match /requests/{id} {
+      function req() {
+        return get(/databases/$(database)/documents/requests/$(id)).data;
+      }
+
+      // The two people a matched request connects — the only ones who can
+      // ever see its chat or calls.
+      function isParticipant() {
+        let r = req();
+        return isSignedIn()
+          && (r.requester_uid == request.auth.uid
+              || r.get('matched_donor_id', null) == request.auth.uid);
+      }
+
+      // Chat and calls are live only while matched and nobody has blocked.
+      function conversationOpen() {
+        let r = req();
+        return r.status == 'matched' && r.get('chat_closed_by', null) == null;
+      }
+
+      function onlyChanges(keys) {
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+      }
+
+      function previewUnchangedOrMine() {
+        return request.resource.data.get('last_message', null) == resource.data.get('last_message', null)
+          || request.resource.data.last_message.sender_uid == request.auth.uid;
+      }
+
       function coreUnchanged() {
         return request.resource.data.requester_uid == resource.data.requester_uid
           && request.resource.data.blood_group == resource.data.blood_group
@@ -134,7 +174,99 @@ service cloud.firestore {
           (resource.data.status == 'open'
             && request.resource.data.status == 'expired'
             && request.time > resource.data.expires_at)
+          ||
+          // the matched donor backs out — request reopens for others with
+          // a fresh (bounded) expiry window. See Backend.releaseMatch.
+          (resource.data.status == 'matched'
+            && resource.data.matched_donor_id == request.auth.uid
+            && request.resource.data.status == 'open'
+            && request.resource.data.matched_donor_id == null
+            && request.resource.data.expires_at <= request.time + duration.value(7, 'h'))
+          ||
+          // either participant closes (blocks) the conversation, once
+          ((resource.data.requester_uid == request.auth.uid
+              || resource.data.get('matched_donor_id', null) == request.auth.uid)
+            && resource.data.get('chat_closed_by', null) == null
+            && request.resource.data.chat_closed_by == request.auth.uid
+            && onlyChanges(['chat_closed_by', 'chat_closed_at']))
+          ||
+          // account deletion scrubs the leaving user's own name/phone
+          // (and the inbox preview, which may quote them)
+          (resource.data.requester_uid == request.auth.uid
+            && onlyChanges(['requester_name', 'requester_phone', 'requester_deleted', 'last_message']))
+          ||
+          (resource.data.get('matched_donor_id', null) == request.auth.uid
+            && onlyChanges(['matched_donor_name', 'matched_donor_phone', 'matched_donor_deleted', 'last_message']))
+          ||
+          // chat bookkeeping: each side moves only its own read marker, and
+          // only the sender may write the inbox preview (always batched
+          // with the message itself — see ChatService._send)
+          (resource.data.requester_uid == request.auth.uid
+            && onlyChanges(['last_message', 'requester_read_at'])
+            && previewUnchangedOrMine())
+          ||
+          (resource.data.get('matched_donor_id', null) == request.auth.uid
+            && onlyChanges(['last_message', 'donor_read_at'])
+            && previewUnchangedOrMine())
       ));
+
+      // Admin cleanup (spam/duplicate/test requests) — not a transition,
+      // so it sits outside coreUnchanged()'s update rule entirely.
+      allow delete: if isAdmin();
+
+      // In-app chat. Only the two participants; append-only (a sender may
+      // delete their own messages — used by account deletion).
+      match /messages/{messageId} {
+        allow read: if isParticipant() || isAdmin();
+        allow create: if isParticipant() && conversationOpen()
+          && request.resource.data.sender_uid == request.auth.uid
+          && request.resource.data.kind in ['text', 'call', 'location']
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 1000
+          && (request.resource.data.kind != 'location'
+              || (request.resource.data.lat is number && request.resource.data.lng is number));
+        allow update: if false;
+        allow delete: if isSignedIn() && resource.data.sender_uid == request.auth.uid;
+      }
+
+      // In-app voice calls — Firestore only carries the WebRTC handshake;
+      // audio is peer-to-peer and never stored.
+      match /calls/{callId} {
+        allow read: if isSignedIn()
+          && (resource.data.caller_uid == request.auth.uid || resource.data.callee_uid == request.auth.uid);
+        allow create: if isParticipant() && conversationOpen()
+          && request.resource.data.caller_uid == request.auth.uid
+          && request.resource.data.callee_uid != request.auth.uid
+          && (request.resource.data.callee_uid == req().requester_uid
+              || request.resource.data.callee_uid == req().get('matched_donor_id', null))
+          && request.resource.data.status == 'ringing';
+        allow update: if isSignedIn()
+          && (resource.data.caller_uid == request.auth.uid || resource.data.callee_uid == request.auth.uid)
+          && request.resource.data.caller_uid == resource.data.caller_uid
+          && request.resource.data.callee_uid == resource.data.callee_uid;
+        allow delete: if false;
+
+        match /{candidateSet}/{candidateId} {
+          allow read, create: if isParticipant()
+            && candidateSet in ['caller_candidates', 'callee_candidates'];
+        }
+      }
+    }
+
+    // Collection-group read for "is anyone calling me?" (CallService
+    // .incomingCalls) — only the call's own two parties.
+    match /{path=**}/calls/{callId} {
+      allow read: if isSignedIn()
+        && (resource.data.callee_uid == request.auth.uid || resource.data.caller_uid == request.auth.uid);
+    }
+
+    // reports/{id} — chat/call abuse reports, reviewed by admins only.
+    match /reports/{reportId} {
+      allow create: if isSignedIn()
+        && request.resource.data.reporter_uid == request.auth.uid
+        && request.resource.data.reason is string;
+      allow read, update: if isAdmin();
+      allow delete: if false;
     }
 
     // donation_history/{id} — immutable once written. Self-reported by
@@ -168,6 +300,77 @@ service cloud.firestore {
     match /audit_log/{id} {
       allow read, create: if isAdmin();
       allow update, delete: if false;
+    }
+
+    // issue_reports/{id} & partnership_inquiries/{id} — one-way submission
+    // forms (Help & support, Partner with us). Any signed-in user can file
+    // one under their own uid; only admins can read the inbox. The author
+    // can never edit or withdraw a submission — but an admin triages it
+    // (status + internal note) from the console's Inbox tab, so admin
+    // update/delete is allowed. Everything an admin writes there is
+    // mirrored into audit_log by the caller.
+    match /issue_reports/{id} {
+      allow create: if isSignedIn() && request.resource.data.reporter_uid == request.auth.uid;
+      allow read: if isAdmin();
+      allow update, delete: if isAdmin();
+    }
+
+    match /partnership_inquiries/{id} {
+      allow create: if isSignedIn() && request.resource.data.requester_uid == request.auth.uid;
+      allow read: if isAdmin();
+      allow update, delete: if isAdmin();
+    }
+
+    // community_stories/{id} — "Share an experience". Readable by any
+    // signed-in user (that's the point), written only under the author's
+    // own uid, and never edited by the author afterwards. Admins moderate:
+    // `is_hidden` (reversible — the feed filters it out client-side) or an
+    // outright delete.
+    match /community_stories/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.author_uid == request.auth.uid;
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // announcements/{id} — Community → What's New. Admin-authored only;
+    // any signed-in user reads them. No user-submitted path at all.
+    match /announcements/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // testimonials/{id} — the curated quotes behind More → Testimonials.
+    // Deliberately separate from community_stories: those are member posts,
+    // these are copy the team has explicit permission to publish, so only
+    // an admin can ever create one.
+    match /testimonials/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // public_stats/impact — the Community Impact counter. A normal user
+    // can't query `requests` for fulfilled ones (those carry phone numbers
+    // and stay private), so the aggregate lives here instead. Any signed-in
+    // user may bump it, but only by exactly +1, or reset to 1 on a new
+    // month — so it can't be inflated in a single write. An admin can set
+    // it to any value (correcting a miscount, or seeding the figure for a
+    // month whose donations were confirmed offline).
+    match /public_stats/{id} {
+      allow read: if isSignedIn();
+
+      allow create: if isAdmin() || (isSignedIn()
+        && request.resource.data.donations_this_month == 1);
+
+      allow update: if isAdmin() || (isSignedIn() && (
+          (request.resource.data.month_key == resource.data.month_key
+            && request.resource.data.donations_this_month == resource.data.donations_this_month + 1)
+          ||
+          (request.resource.data.month_key != resource.data.month_key
+            && request.resource.data.donations_this_month == 1)
+      ));
+
+      allow delete: if isAdmin();
     }
 
     match /{document=**} {

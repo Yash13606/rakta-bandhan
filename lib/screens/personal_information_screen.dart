@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../services/backend.dart';
@@ -40,6 +41,26 @@ class _PersonalInformationScreenState extends State<PersonalInformationScreen> {
     return trimmed.split(RegExp(r'\s+')).take(2).map((w) => w[0].toUpperCase()).join();
   }
 
+  Future<void> _openEditSheet({required String name, required String phone}) async {
+    final nameController = TextEditingController(text: name);
+    final phoneController = TextEditingController(text: phone);
+    final saved = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => _EditProfileSheet(
+        nameController: nameController,
+        phoneController: phoneController,
+      ),
+    );
+    nameController.dispose();
+    phoneController.dispose();
+    if (saved == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Profile updated.')),
+      );
+    }
+  }
+
   Future<void> _uploadIdProof() async {
     final picked = await showModalBottomSheet<XFile?>(
       context: context,
@@ -50,12 +71,18 @@ class _PersonalInformationScreenState extends State<PersonalInformationScreen> {
             ListTile(
               leading: const Icon(LucideIcons.camera),
               title: const Text('Take a photo'),
-              onTap: () async => Navigator.pop(context, await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 1280, imageQuality: 70)),
+              onTap: () async {
+                final file = await ImagePicker().pickImage(source: ImageSource.camera, maxWidth: 1280, imageQuality: 70);
+                if (context.mounted) Navigator.pop(context, file);
+              },
             ),
             ListTile(
               leading: const Icon(LucideIcons.image),
               title: const Text('Choose from gallery'),
-              onTap: () async => Navigator.pop(context, await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 1280, imageQuality: 70)),
+              onTap: () async {
+                final file = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 1280, imageQuality: 70);
+                if (context.mounted) Navigator.pop(context, file);
+              },
             ),
           ],
         ),
@@ -114,7 +141,7 @@ class _PersonalInformationScreenState extends State<PersonalInformationScreen> {
                   final phone = data['phone'] as String? ?? '—';
                   final bloodGroup = data['blood_group'] as String? ?? '—';
                   final isVerified = data['is_verified'] as bool? ?? false;
-                  final idProofBase64 = data['id_proof_base64'] as String?;
+                  final hasIdProof = data['has_id_proof'] == true || data['id_proof_base64'] != null;
                   final createdAt = data['created_at'] as Timestamp?;
                   final lat = data['lat'] as num?;
                   final lng = data['lng'] as num?;
@@ -140,7 +167,7 @@ class _PersonalInformationScreenState extends State<PersonalInformationScreen> {
                                   Positioned(
                                     right: -6,
                                     bottom: -4,
-                                    child: BloodGroupDroplet(label: bloodGroup, size: 26, filled: true, color: AppColors.primary, textColor: const Color(0xFFFBE6E8), fontSize: 9),
+                                    child: BloodGroupDroplet(label: bloodGroup, size: 26, filled: true, color: AppColors.primary, textColor: AppColors.onEmber, fontSize: 9),
                                   ),
                               ],
                             ),
@@ -178,9 +205,9 @@ class _PersonalInformationScreenState extends State<PersonalInformationScreen> {
                             valueColor: isVerified ? AppColors.warmGreenText : AppColors.warmAmberText,
                             iconBg: isVerified ? AppColors.warmGreenBg : AppColors.warmAmberBg,
                             iconColor: isVerified ? AppColors.warmGreenText : AppColors.warmAmberText,
-                            isLast: idProofBase64 != null,
+                            isLast: hasIdProof,
                           ),
-                          if (idProofBase64 == null)
+                          if (!hasIdProof)
                             Padding(
                               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                               child: Row(
@@ -219,6 +246,18 @@ class _PersonalInformationScreenState extends State<PersonalInformationScreen> {
                           ),
                         ),
                         const SizedBox(height: 24),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            onPressed: () => _openEditSheet(
+                              name: data['name'] as String? ?? '',
+                              phone: data['phone'] as String? ?? '',
+                            ),
+                            icon: const Icon(LucideIcons.pencil, size: 15),
+                            label: const Text('Edit name & number'),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
                         Container(
                           padding: const EdgeInsets.all(13),
                           decoration: BoxDecoration(
@@ -226,7 +265,7 @@ class _PersonalInformationScreenState extends State<PersonalInformationScreen> {
                             borderRadius: BorderRadius.circular(14),
                           ),
                           child: const Text(
-                            'Editing your details is not available yet — the profile-update endpoint is still to be built. Contact an administrator if something here is wrong.',
+                            'Blood group and verification status are set by an administrator and cannot be changed here.',
                             style: TextStyle(fontSize: 12, color: AppColors.textSecondary, height: 1.5),
                           ),
                         ),
@@ -308,6 +347,88 @@ class _PersonalInformationScreenState extends State<PersonalInformationScreen> {
                     color: valueColor ?? AppColors.textPrimaryWarm,
                   ),
                 ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Edit sheet for the two fields a donor owns outright. Blood group is
+/// excluded on purpose: it drives matching, and an unverified self-edit of
+/// it would silently change who this donor can give to.
+class _EditProfileSheet extends StatefulWidget {
+  final TextEditingController nameController;
+  final TextEditingController phoneController;
+
+  const _EditProfileSheet({required this.nameController, required this.phoneController});
+
+  @override
+  State<_EditProfileSheet> createState() => _EditProfileSheetState();
+}
+
+class _EditProfileSheetState extends State<_EditProfileSheet> {
+  bool _saving = false;
+  String? _nameError;
+  String? _phoneError;
+
+  Future<void> _save() async {
+    final name = widget.nameController.text.trim();
+    final phone = widget.phoneController.text.trim();
+    setState(() {
+      _nameError = name.isEmpty ? 'Name is required' : null;
+      _phoneError = phone.length != 10 ? 'Enter a valid 10-digit number' : null;
+    });
+    if (_nameError != null || _phoneError != null) return;
+
+    setState(() => _saving = true);
+    try {
+      await Backend.instance.updateProfile(name: name, phone: phone);
+      if (mounted) Navigator.pop(context, true);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _saving = false;
+        _nameError = 'Could not save. Please try again.';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom + MediaQuery.of(context).padding.bottom;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(20, 16, 20, bottomInset + 20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text('Edit your details', style: AppTextStyles.display(fontSize: 19, color: AppColors.textPrimaryWarm)),
+          const SizedBox(height: 18),
+          const Text('Full name', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: AppColors.textPrimaryWarm)),
+          const SizedBox(height: 6),
+          TextField(
+            controller: widget.nameController,
+            decoration: InputDecoration(hintText: 'Your name', errorText: _nameError),
+          ),
+          const SizedBox(height: 14),
+          const Text('WhatsApp number', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: AppColors.textPrimaryWarm)),
+          const SizedBox(height: 6),
+          TextField(
+            controller: widget.phoneController,
+            keyboardType: TextInputType.phone,
+            inputFormatters: [
+              FilteringTextInputFormatter.digitsOnly,
+              LengthLimitingTextInputFormatter(10),
+            ],
+            decoration: InputDecoration(hintText: '10-digit number', errorText: _phoneError),
+          ),
+          const SizedBox(height: 20),
+          ElevatedButton(
+            onPressed: _saving ? null : _save,
+            child: _saving
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Text('Save changes'),
+          ),
         ],
       ),
     );

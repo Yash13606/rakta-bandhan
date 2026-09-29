@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
+import '../services/backend.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text_styles.dart';
 import '../widgets/filter_chip_row.dart';
@@ -69,7 +70,7 @@ class _HelpSupportScreenState extends State<HelpSupportScreen> {
     ),
     (
       'How do I report an issue?',
-      'Use "Report an issue" below. There is no backend yet to receive or track reports, so nothing is sent anywhere — the form shows you what the flow will look like once that’s wired up.',
+      'Use "Report an issue" below. It goes straight to the admin team\'s inbox.',
     ),
     (
       'Is this app a substitute for emergency medical services?',
@@ -164,7 +165,7 @@ class _HelpSupportScreenState extends State<HelpSupportScreen> {
                       ),
                     ),
                     const SizedBox(height: 22),
-                    const Text('COMMON QUESTIONS', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, letterSpacing: 1.2, color: AppColors.ink2)),
+                    const Text('Common questions', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, letterSpacing: 0.1, color: AppColors.ink2)),
                     const SizedBox(height: 10),
                     if (_filtered.isEmpty)
                       Container(
@@ -258,12 +259,36 @@ class _ReportIssueSheetState extends State<_ReportIssueSheet> {
 
   String? _reason;
   final _detailsController = TextEditingController();
+  bool _submitting = false;
   bool _submitted = false;
+  String? _error;
 
   @override
   void dispose() {
     _detailsController.dispose();
     super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_reason == null || _submitting) return;
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    try {
+      await Backend.instance.submitIssueReport(reason: _reason!, details: _detailsController.text);
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _submitted = true;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _error = 'Could not send this. Please try again.';
+      });
+    }
   }
 
   @override
@@ -287,21 +312,21 @@ class _ReportIssueSheetState extends State<_ReportIssueSheet> {
                   padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(color: AppColors.goldTint, border: const Border(left: BorderSide(color: AppColors.gold, width: 3)), borderRadius: const BorderRadius.horizontal(right: Radius.circular(12))),
                   child: const Text(
-                    'There’s no backend yet to receive or track reports, so nothing was actually sent anywhere. This screen is showing you what submitting will look like once that’s wired up — your details above were not saved.',
+                    'Your report has been sent to the admin team.',
                     style: TextStyle(fontSize: 13, color: AppColors.goldDeepest, height: 1.5),
                   ),
                 ),
                 const SizedBox(height: 16),
                 SizedBox(width: double.infinity, child: OutlinedButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))),
               ] else ...[
-                const Text('REASON', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, letterSpacing: 1, color: AppColors.ink2)),
+                const Text('Reason', style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, letterSpacing: 0.1, color: AppColors.ink2)),
                 const SizedBox(height: 8),
                 FilterChipRow(
                   activeBg: AppColors.primary,
                   chips: [for (final r in _reasons) FilterChipItem(label: r, active: _reason == r, onTap: () => setState(() => _reason = r))],
                 ),
                 const SizedBox(height: 16),
-                const Text('DETAILS (OPTIONAL)', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, letterSpacing: 1, color: AppColors.ink2)),
+                const Text('Details (optional)', style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, letterSpacing: 0.1, color: AppColors.ink2)),
                 const SizedBox(height: 8),
                 Container(
                   decoration: BoxDecoration(color: Colors.white, border: Border.all(color: AppColors.warmBorder), borderRadius: BorderRadius.circular(12)),
@@ -312,17 +337,18 @@ class _ReportIssueSheetState extends State<_ReportIssueSheet> {
                     decoration: const InputDecoration(hintText: 'What went wrong?', border: InputBorder.none, filled: false, contentPadding: EdgeInsets.all(12)),
                   ),
                 ),
-                const SizedBox(height: 8),
-                const Text(
-                  'Reporting has no backend yet — this won’t reach a real team until that’s built. Submitting just previews the flow.',
-                  style: TextStyle(fontSize: 11.5, color: AppColors.disabledTint, height: 1.4),
-                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 8),
+                  Text(_error!, style: const TextStyle(fontSize: 11.5, color: AppColors.primary)),
+                ],
                 const SizedBox(height: 16),
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton(
-                    onPressed: _reason == null ? null : () => setState(() => _submitted = true),
-                    child: const Text('Submit'),
+                    onPressed: (_reason == null || _submitting) ? null : _submit,
+                    child: _submitting
+                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                        : const Text('Submit'),
                   ),
                 ),
               ],
